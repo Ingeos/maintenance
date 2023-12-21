@@ -19,6 +19,10 @@ class MaintenanceEquipment(models.Model):
         compute="_compute_maintenance_plan_count",
         store=True,
     )
+    search_maintenance_plan_count = fields.Integer(
+        compute="_compute_search_maintenance_plan_count",
+        string="Maintenance All Plan Count",
+    )
     maintenance_team_required = fields.Boolean(compute="_compute_team_required")
     notes = fields.Text()
 
@@ -27,6 +31,15 @@ class MaintenanceEquipment(models.Model):
         for equipment in self:
             equipment.maintenance_plan_count = len(
                 equipment.with_context(active_test=False).maintenance_plan_ids
+            )
+
+    @api.depends("maintenance_plan_ids")
+    def _compute_search_maintenance_plan_count(self):
+        for equipment in self:
+            equipment.search_maintenance_plan_count = (
+                self.env["maintenance.plan"]
+                .with_context(active_test=False)
+                .search_count([("search_equipment_id", "=", equipment.id)])
             )
 
     @api.depends("maintenance_plan_ids")
@@ -54,10 +67,24 @@ class MaintenanceEquipment(models.Model):
                     )
                 )
 
+    def _prepare_requests_from_plan(self, maintenance_plan, next_maintenance_date):
+        if self:
+            return self._prepare_request_from_plan(
+                maintenance_plan, next_maintenance_date
+            )
+        equipments = maintenance_plan._get_maintenance_equipments()
+        return [
+            equipment._prepare_request_from_plan(
+                maintenance_plan, next_maintenance_date
+            )
+            for equipment in equipments
+        ]
+
     def _prepare_request_from_plan(self, maintenance_plan, next_maintenance_date):
         team_id = maintenance_plan.maintenance_team_id.id or self.maintenance_team_id.id
+        request_model = self.env["maintenance.request"]
         if not team_id:
-            team_id = self.env["maintenance.request"]._get_default_team_id()
+            team_id = request_model._get_default_team_id()
 
         description = self.name if self else maintenance_plan.name
         kind = maintenance_plan.maintenance_kind_id.name or _("Unspecified kind")
@@ -67,7 +94,7 @@ class MaintenanceEquipment(models.Model):
             description=description,
         )
 
-        return {
+        data = {
             "name": name,
             "request_date": next_maintenance_date,
             "schedule_date": next_maintenance_date,
@@ -83,6 +110,10 @@ class MaintenanceEquipment(models.Model):
             "note": maintenance_plan.note,
             "company_id": maintenance_plan.company_id.id or self.company_id.id,
         }
+        # This field comes from maintenance_timesheet for avoiding a glue module
+        if "planned_hours" in request_model._fields:
+            data["planned_hours"] = maintenance_plan.duration
+        return data
 
     def _create_new_request(self, mtn_plan):
         # Compute horizon date adding to today the planning horizon
@@ -109,12 +140,18 @@ class MaintenanceEquipment(models.Model):
             )
         else:
             next_maintenance_date = mtn_plan.next_maintenance_date
-        requests = self.env["maintenance.request"]
+        skip_notify_follower = mtn_plan.skip_notify_follower_on_requests
+        # Skip assigned mail + Activity mail
+        request_model = self.env["maintenance.request"].with_context(
+            mail_activity_quick_update=skip_notify_follower,
+            mail_auto_subscribe_no_notify=skip_notify_follower,
+        )
+        requests = request_model
         # Create maintenance request until we reach planning horizon
         while next_maintenance_date <= horizon_date:
             if next_maintenance_date >= fields.Date.today():
-                vals = self._prepare_request_from_plan(mtn_plan, next_maintenance_date)
-                requests |= self.env["maintenance.request"].create(vals)
+                vals = self._prepare_requests_from_plan(mtn_plan, next_maintenance_date)
+                requests |= request_model.create(vals)
             next_maintenance_date = next_maintenance_date + mtn_plan.get_relativedelta(
                 mtn_plan.interval, mtn_plan.interval_step or "year"
             )

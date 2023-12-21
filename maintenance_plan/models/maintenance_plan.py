@@ -6,6 +6,7 @@ from dateutil.relativedelta import relativedelta
 
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
+from odoo.tools import safe_eval
 
 
 class MaintenancePlan(models.Model):
@@ -75,6 +76,47 @@ class MaintenancePlan(models.Model):
         compute="_compute_maintenance_count", string="Current Maintenance", store=True
     )
     maintenance_team_id = fields.Many2one("maintenance.team")
+    skip_notify_follower_on_requests = fields.Boolean(
+        string="Do not notify to follower when creating requests?", default=True
+    )
+    generate_with_domain = fields.Boolean()
+    generate_domain = fields.Char(string="Apply on")
+    search_equipment_id = fields.Many2one(
+        comodel_name="maintenance.equipment",
+        compute="_compute_search_equipment",
+        search="_search_search_equipment",
+    )
+
+    @api.model
+    def _search_search_equipment(self, operator, value):
+        if operator != "=" or (not value and not isinstance(value, models.NewId)):
+            raise ValueError(_("Unsupported search operator"))
+        plans = self.search([("generate_with_domain", "=", True)])
+        plan_ids = []
+        equipment = self.env["maintenance.equipment"].browse(value)
+        for plan in plans:
+            if equipment.filtered_domain(
+                safe_eval.safe_eval(
+                    plan.generate_domain or "[]", plan._get_eval_context()
+                )
+            ):
+                plan_ids.append(plan.id)
+        return ["|", ("equipment_id", "=", value), ("id", "in", plan_ids)]
+
+    @api.depends("equipment_id")
+    def _compute_search_equipment(self):
+        for record in self:
+            record.search_equipment_id = record.equipment_id
+
+    def _get_eval_context(self):
+        """Prepare the context used when evaluating python code
+        :returns: dict -- evaluation context given to safe_eval
+        """
+        return {
+            "datetime": safe_eval.datetime,
+            "dateutil": safe_eval.dateutil,
+            "time": safe_eval.time,
+        }
 
     def name_get(self):
         result = []
@@ -120,7 +162,7 @@ class MaintenancePlan(models.Model):
     def _compute_next_maintenance(self):
         for plan in self.filtered(lambda x: x.interval > 0):
 
-            interval_timedelta = self.get_relativedelta(
+            interval_timedelta = plan.get_relativedelta(
                 plan.interval, plan.interval_step
             )
 
@@ -200,3 +242,20 @@ class MaintenancePlan(models.Model):
             "equipment maintenance plan.",
         )
     ]
+
+    def button_manual_request_generation(self):
+        """Call the same method that the cron for generating manually the maintenance
+        requests."""
+        for plan in self:
+            equipment = plan.equipment_id
+            equipment._create_new_request(plan)
+
+    def _get_maintenance_equipments(self):
+        self.ensure_one()
+        if self.generate_with_domain and not self.equipment_id:
+            return self.env["maintenance.equipment"].search(
+                safe_eval.safe_eval(
+                    self.generate_domain or "[]", self._get_eval_context()
+                )
+            )
+        return [self.equipment_id]
